@@ -1,0 +1,665 @@
+#!/usr/bin/env -S java --source 25
+
+String name = MethodHandles.lookup().lookupClass().getName();
+String version = "2026-08-30.1";
+
+static final String PREFIX = "zac-";
+static final String MOUNT_TARGET = "/workspace";
+static final String CONTAINER = "container";
+static final int ZAC_ERROR = 2;
+
+enum Log {
+
+    ERROR(Color.RED, System.err),
+    WARNING(Color.YELLOW, System.out),
+    INFO(Color.GREEN, System.out),
+    USER(Color.CYAN, System.out);
+
+    enum Color {
+        YELLOW("\033[38;2;181;137;0m"),
+        RED("\033[38;2;220;50;47m"),
+        CYAN("\033[38;2;42;161;152m"),
+        GREEN("\033[38;2;133;153;0m");
+
+        String code;
+
+        Color(String code) {
+            this.code = code;
+        }
+    }
+
+    static final String RESET = "\033[0m";
+
+    String value;
+    PrintStream out;
+
+    Log(Color color, PrintStream out) {
+        this.value = color.code + "%s" + RESET;
+        this.out = out;
+    }
+
+    void out(String message) {
+        this.out.println(this.value.formatted(message));
+    }
+
+    static void error(String message) {
+        ERROR.out(message);
+    }
+
+    static void warning(String message) {
+        WARNING.out(message);
+    }
+
+    static void info(String message) {
+        INFO.out(message);
+    }
+
+    static void user(String message) {
+        USER.out(message);
+    }
+
+    /// Exits 2, not zcl's 0: zac propagates the agent's exit code, so its own
+    /// failures need a band that cannot be mistaken for the agent's result.
+    static void fail(String message) {
+        error(message);
+        System.exit(ZAC_ERROR);
+    }
+}
+
+enum Capability {
+    WRITE, NET, SSH
+}
+
+enum Profile {
+
+    SEALED(Set.of()),
+    REVIEW(Set.of(Capability.NET)),
+    BUILD(Set.of(Capability.WRITE, Capability.NET)),
+    TRUSTED(Set.of(Capability.WRITE, Capability.NET, Capability.SSH));
+
+    Set<Capability> grants;
+
+    Profile(Set<Capability> grants) {
+        this.grants = grants;
+    }
+
+    static Profile from(String value) {
+        return Stream.of(values())
+                .filter(profile -> profile.name().equalsIgnoreCase(value))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("unknown profile: %s - valid: %s".formatted(value, names())));
+    }
+
+    static String names() {
+        return Stream.of(values()).map(Profile::label).collect(Collectors.joining(", "));
+    }
+
+    String label() {
+        return name().toLowerCase();
+    }
+}
+
+enum Verb {
+
+    RUN, CREATE, START, EXEC, LS, INSPECT, LOGS, STOP, RM;
+
+    EnumSet<Opt> allowed() {
+        return switch (this) {
+            case RUN, CREATE -> EnumSet.of(Opt.PROFILE, Opt.WORKSPACE, Opt.RO, Opt.RW, Opt.NET, Opt.NO_NET,
+                    Opt.SSH, Opt.NO_SSH, Opt.SECRET, Opt.CPUS, Opt.MEMORY, Opt.IMAGE, Opt.WORKDIR, Opt.NAME, Opt.DRY_RUN);
+            case EXEC -> EnumSet.of(Opt.WORKDIR, Opt.DRY_RUN);
+            case LS -> EnumSet.of(Opt.ALL, Opt.DRY_RUN);
+            case LOGS -> EnumSet.of(Opt.FOLLOW, Opt.LINES, Opt.DRY_RUN);
+            case START, STOP, RM, INSPECT -> EnumSet.of(Opt.DRY_RUN);
+        };
+    }
+
+    boolean creates() {
+        return this == RUN || this == CREATE;
+    }
+
+    String subcommand() {
+        return name().toLowerCase();
+    }
+
+    static Verb from(String value) {
+        return Stream.of(values())
+                .filter(verb -> verb.name().equalsIgnoreCase(value))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("unknown command: %s - valid: %s".formatted(value, names())));
+    }
+
+    static String names() {
+        return Stream.of(values()).map(Verb::subcommand).collect(Collectors.joining(", "));
+    }
+}
+
+enum Opt {
+
+    HELP("-help", false, "show this help"),
+    VERSION("-version", false, "show version"),
+    PROFILE("-profile", true, "sealed | review | build | trusted (default: sealed)"),
+    WORKSPACE("-workspace", true, "host directory to expose (default: .)"),
+    RO("-ro", false, "workspace read-only (default)"),
+    RW("-rw", false, "workspace read-write"),
+    NET("-net", false, "enable network access"),
+    NO_NET("-no-net", false, "disable network access (default)"),
+    SSH("-ssh", false, "forward the SSH agent socket"),
+    NO_SSH("-no-ssh", false, "do not forward the SSH agent socket (default)"),
+    SECRET("-secret", true, "inherit a host environment variable by name, repeatable"),
+    CPUS("-cpus", true, "CPU limit (default: 2)"),
+    MEMORY("-memory", true, "memory limit (default: 2G)"),
+    IMAGE("-image", true, "container image (default: $ZAC_IMAGE)"),
+    WORKDIR("-workdir", true, "working directory in the capsule (default: /workspace)"),
+    NAME("-name", true, "capsule name (default: generated)"),
+    ALL("-all", false, "ls: include stopped capsules"),
+    FOLLOW("-follow", false, "logs: follow output"),
+    LINES("-lines", true, "logs: number of trailing lines"),
+    DRY_RUN("-dry-run", false, "print the container command and exit");
+
+    String option;
+    boolean valued;
+    String description;
+
+    Opt(String option, boolean valued, String description) {
+        this.option = option;
+        this.valued = valued;
+        this.description = description;
+    }
+
+    boolean matches(String value) {
+        return this.option.equals(value) || value.startsWith(this.option + ":");
+    }
+
+    static Opt from(String value) {
+        return Stream.of(values())
+                .filter(opt -> opt.matches(value))
+                .findFirst()
+                .orElse(null);
+    }
+
+    static String usage() {
+        return Stream.of(values())
+                .map(opt -> "  %-14s %s".formatted(opt.option, opt.description))
+                .collect(Collectors.joining("\n"));
+    }
+}
+
+record Capsule(String id, String image, Path workspace, Set<Capability> grants, List<String> secrets,
+               String cpus, String memory, String workdir, Profile profile, List<String> command) {
+
+    boolean can(Capability capability) {
+        return this.grants.contains(capability);
+    }
+
+    /// --mount rather than -v: -v passes its third field through unvalidated, so a
+    /// typo in :ro yields a read-write mount, while --mount rejects unknown directives.
+    String mountFlag() {
+        var readonly = can(Capability.WRITE) ? "" : ",readonly";
+        return "type=virtiofs,source=%s,target=%s%s".formatted(this.workspace, MOUNT_TARGET, readonly);
+    }
+
+    /// "none" is matched against the raw argument, so it must be passed bare.
+    /// Omitting --network attaches the builtin network instead of disabling it.
+    List<String> networkFlags() {
+        return can(Capability.NET) ? List.of() : List.of("--network", "none", "--no-dns");
+    }
+
+    List<String> sshFlags() {
+        return can(Capability.SSH) ? List.of("--ssh") : List.of();
+    }
+
+    /// A bare key makes container inherit the host value, keeping it out of the process list.
+    List<String> secretFlags() {
+        return this.secrets.stream().flatMap(Capsule::inherit).toList();
+    }
+
+    static Stream<String> inherit(String key) {
+        return Stream.of("-e", key);
+    }
+
+    String posture() {
+        return "%s+%s+%s".formatted(can(Capability.WRITE) ? "rw" : "ro",
+                can(Capability.NET) ? "net" : "nonet",
+                can(Capability.SSH) ? "ssh" : "nossh");
+    }
+
+    List<String> labelFlags() {
+        return List.of("--label", "zac=capsule",
+                "--label", "zac.profile=" + this.profile.label(),
+                "--label", "zac.posture=" + posture(),
+                "--label", "zac.workspace=" + this.workspace);
+    }
+
+    /// No "--" is emitted before the command: container declares its trailing
+    /// arguments .captureForPassthrough, which would hand the separator to the agent.
+    List<String> argv(Verb verb) {
+        var argv = new ArrayList<String>(List.of(CONTAINER, verb.subcommand()));
+        if (verb == Verb.RUN) {
+            argv.add("--rm");
+            argv.addAll(ttyFlags());
+        }
+        argv.addAll(List.of("--init", "--name", this.id, "--mount", mountFlag()));
+        argv.addAll(networkFlags());
+        argv.addAll(sshFlags());
+        argv.addAll(secretFlags());
+        argv.addAll(List.of("--cpus", this.cpus, "--memory", this.memory, "-w", this.workdir));
+        argv.addAll(labelFlags());
+        argv.add(this.image);
+        argv.addAll(this.command);
+        return List.copyOf(argv);
+    }
+
+    String summary() {
+        return """
+                capsule %s  profile=%s
+                  workspace   %s -> %s  (%s)
+                  network     %s
+                  credentials %s
+                  secrets     %s
+                  limits      cpus=%s memory=%s
+                  image       %s\
+                """.formatted(this.id, this.profile.label(),
+                this.workspace, MOUNT_TARGET, can(Capability.WRITE) ? "read-write" : "read-only",
+                can(Capability.NET) ? "enabled" : "disabled",
+                can(Capability.SSH) ? "enabled" : "disabled",
+                this.secrets.isEmpty() ? "none" : String.join(", ", this.secrets) + " (inherited)",
+                this.cpus, this.memory, this.image);
+    }
+}
+
+record Params(Verb verb, String target, Capsule capsule, List<String> command, String workdir,
+              boolean dryRun, boolean all, boolean follow, String lines) {}
+
+record Split(List<String> options, List<String> command) {}
+
+record Output(int status, String stdout) {}
+
+void main(String... args) throws Exception {
+    IO.println("%s %s".formatted(this.name, this.version));
+    try {
+        System.exit(dispatch(args));
+    } catch (IllegalArgumentException | IOException e) {
+        Log.fail(e.getMessage());
+    }
+}
+
+int dispatch(String... args) throws Exception {
+    var split = split(List.of(args));
+    var options = split.options();
+    if (options.isEmpty() || options.contains(Opt.HELP.option)) {
+        IO.println(usage());
+        return 0;
+    }
+    if (options.contains(Opt.VERSION.option)) {
+        return 0;
+    }
+    var verb = Verb.from(options.getFirst());
+    var params = parse(verb, normalize(options.subList(1, options.size())), split.command());
+    return execute(params);
+}
+
+int execute(Params params) throws Exception {
+    return switch (params.verb()) {
+        case RUN, CREATE -> launch(params);
+        case EXEC -> exec(params);
+        case LS -> list(params);
+        case INSPECT -> inspect(params);
+        case START, STOP, RM, LOGS -> simple(params);
+    };
+}
+
+/// Everything after a bare "--" is the agent's command and is never re-parsed.
+Split split(List<String> args) {
+    var index = args.indexOf("--");
+    if (index < 0) {
+        return new Split(args, List.of());
+    }
+    return new Split(args.subList(0, index), List.copyOf(args.subList(index + 1, args.size())));
+}
+
+/// Rewrites "-opt value" into "-opt:value" so the parse loop sees a single form.
+List<String> normalize(List<String> args) {
+    var normalized = new ArrayList<String>();
+    for (var i = 0; i < args.size(); i++) {
+        var arg = args.get(i);
+        var opt = Opt.from(arg);
+        if (opt == null || !opt.valued || arg.contains(":")) {
+            normalized.add(arg);
+            continue;
+        }
+        if (i + 1 >= args.size()) {
+            throw new IllegalArgumentException("missing value for " + arg);
+        }
+        normalized.add(arg + ":" + args.get(++i));
+    }
+    return List.copyOf(normalized);
+}
+
+Params parse(Verb verb, List<String> options, List<String> command) {
+    var used = EnumSet.noneOf(Opt.class);
+    var granted = EnumSet.noneOf(Capability.class);
+    var revoked = EnumSet.noneOf(Capability.class);
+    var secrets = new ArrayList<String>();
+    var positional = new ArrayList<String>();
+    var profiles = new ArrayList<Profile>();
+    var workspace = ".";
+    var image = System.getenv("ZAC_IMAGE");
+    var cpus = "2";
+    var memory = "2G";
+    String workdir = null;
+    String id = null;
+    String lines = null;
+    var dryRun = false;
+    var all = false;
+    var follow = false;
+
+    for (var arg : options) {
+        var opt = Opt.from(arg);
+        if (opt == null) {
+            if (arg.startsWith("-")) {
+                throw new IllegalArgumentException("unknown option: " + arg);
+            }
+            positional.add(arg);
+            continue;
+        }
+        used.add(opt);
+        switch (opt) {
+            case PROFILE -> profiles.add(Profile.from(value(arg)));
+            case WORKSPACE -> workspace = value(arg);
+            case RW -> granted.add(Capability.WRITE);
+            case RO -> revoked.add(Capability.WRITE);
+            case NET -> granted.add(Capability.NET);
+            case NO_NET -> revoked.add(Capability.NET);
+            case SSH -> granted.add(Capability.SSH);
+            case NO_SSH -> revoked.add(Capability.SSH);
+            case SECRET -> secrets.add(secret(value(arg)));
+            case CPUS -> cpus = value(arg);
+            case MEMORY -> memory = value(arg);
+            case IMAGE -> image = value(arg);
+            case WORKDIR -> workdir = value(arg);
+            case NAME -> id = value(arg);
+            case ALL -> all = true;
+            case FOLLOW -> follow = true;
+            case LINES -> lines = value(arg);
+            case DRY_RUN -> dryRun = true;
+            case HELP, VERSION -> {}
+        }
+    }
+    reject(verb, used);
+    if (positional.size() > 1) {
+        throw new IllegalArgumentException("expected at most one capsule name, got: " + String.join(", ", positional));
+    }
+    var target = positional.isEmpty() ? id : positional.getFirst();
+    if (!verb.creates() && verb != Verb.LS && target == null) {
+        throw new IllegalArgumentException(verb.subcommand() + " requires a capsule name");
+    }
+    var capsule = verb.creates()
+            ? capsule(target, image, workspace, profiles, granted, revoked, secrets, cpus, memory, workdir, command)
+            : null;
+    return new Params(verb, target, capsule, command, workdir, dryRun, all, follow, lines);
+}
+
+Capsule capsule(String target, String image, String workspace, List<Profile> profiles,
+                Set<Capability> granted, Set<Capability> revoked, List<String> secrets,
+                String cpus, String memory, String workdir, List<String> command) {
+    if (profiles.size() > 1) {
+        throw new IllegalArgumentException("only one -profile may be given");
+    }
+    if (image == null || image.isBlank()) {
+        throw new IllegalArgumentException("no image - pass -image:<ref> or set ZAC_IMAGE");
+    }
+    var profile = profiles.isEmpty() ? Profile.SEALED : profiles.getFirst();
+    var grants = resolve(profile, granted, revoked);
+    if (grants.contains(Capability.SSH) && System.getenv("SSH_AUTH_SOCK") == null) {
+        throw new IllegalArgumentException("SSH forwarding granted but SSH_AUTH_SOCK is not set on the host");
+    }
+    secrets.stream().filter(this::isUnset).findFirst().ifPresent(this::missingSecret);
+    var id = target == null ? generated() : target;
+    return new Capsule(PREFIX + id, image, directory(workspace), grants, List.copyOf(secrets),
+            cpus, memory, workdir == null ? MOUNT_TARGET : workdir, profile, command);
+}
+
+/// The profile is the baseline; explicit flags always win, wherever they appear.
+/// A posture must never depend on argument order.
+Set<Capability> resolve(Profile profile, Set<Capability> granted, Set<Capability> revoked) {
+    var conflicts = EnumSet.copyOf(granted);
+    conflicts.retainAll(revoked);
+    if (!conflicts.isEmpty()) {
+        throw new IllegalArgumentException("conflicting capability flags for: " + labels(conflicts));
+    }
+    var grants = EnumSet.noneOf(Capability.class);
+    grants.addAll(profile.grants);
+    grants.addAll(granted);
+    grants.removeAll(revoked);
+    return Set.copyOf(grants);
+}
+
+void reject(Verb verb, Set<Opt> used) {
+    var rejected = EnumSet.copyOf(used);
+    rejected.removeAll(verb.allowed());
+    if (rejected.isEmpty()) {
+        return;
+    }
+    if (verb == Verb.EXEC && rejected.stream().anyMatch(this::isCapabilityOpt)) {
+        throw new IllegalArgumentException("exec cannot change capabilities; they are fixed at run/create time");
+    }
+    var names = rejected.stream().map(opt -> opt.option).collect(Collectors.joining(", "));
+    throw new IllegalArgumentException("%s does not accept: %s".formatted(verb.subcommand(), names));
+}
+
+boolean isCapabilityOpt(Opt opt) {
+    return EnumSet.of(Opt.RO, Opt.RW, Opt.NET, Opt.NO_NET, Opt.SSH, Opt.NO_SSH, Opt.PROFILE,
+            Opt.SECRET, Opt.WORKSPACE).contains(opt);
+}
+
+boolean isUnset(String key) {
+    return System.getenv(key) == null;
+}
+
+void missingSecret(String key) {
+    throw new IllegalArgumentException("secret %s is not set on the host".formatted(key));
+}
+
+String value(String arg) {
+    var value = arg.substring(arg.indexOf(':') + 1);
+    if (value.isBlank()) {
+        throw new IllegalArgumentException("missing value for " + arg);
+    }
+    return value;
+}
+
+String secret(String key) {
+    if (key.contains("=")) {
+        throw new IllegalArgumentException("-secret takes a variable name, not a value: " + key.substring(0, key.indexOf('=')));
+    }
+    return key;
+}
+
+/// toRealPath resolves relative paths, follows the macOS /tmp symlink that virtiofs
+/// needs resolved, and fails for a missing directory - all in one call.
+Path directory(String workspace) {
+    try {
+        var path = Path.of(workspace).toRealPath();
+        if (!Files.isDirectory(path)) {
+            throw new IllegalArgumentException("workspace is not a directory: " + path);
+        }
+        var home = Path.of(System.getProperty("user.home")).toRealPath();
+        if (home.startsWith(path)) {
+            throw new IllegalArgumentException("refusing to mount %s - it is your home directory or an ancestor of it".formatted(path));
+        }
+        return path;
+    } catch (IOException _) {
+        throw new IllegalArgumentException("workspace not found: " + workspace);
+    }
+}
+
+String generated() {
+    return UUID.randomUUID().toString().substring(0, 8);
+}
+
+String labels(Set<Capability> capabilities) {
+    return capabilities.stream().map(Capability::name).map(String::toLowerCase).collect(Collectors.joining(", "));
+}
+
+int launch(Params params) throws Exception {
+    var capsule = params.capsule();
+    Log.user(capsule.summary());
+    warn(capsule);
+    return submit(params, capsule.argv(params.verb()));
+}
+
+void warn(Capsule capsule) {
+    if (!capsule.can(Capability.NET)) {
+        Log.warning("""
+                warning: network is disabled - the agent cannot reach its model API.
+                         Use -profile:review or -net to grant it.\
+                """);
+    }
+    if (capsule.profile() == Profile.TRUSTED) {
+        Log.warning("warning: profile 'trusted' grants write, network and SSH - the capsule is effectively unsandboxed.");
+    }
+}
+
+int exec(Params params) throws Exception {
+    if (params.command().isEmpty()) {
+        throw new IllegalArgumentException("exec requires a command after --");
+    }
+    var argv = new ArrayList<String>(List.of(CONTAINER, Verb.EXEC.subcommand()));
+    argv.addAll(ttyFlags());
+    if (params.workdir() != null) {
+        argv.addAll(List.of("-w", params.workdir()));
+    }
+    argv.add(PREFIX + params.target());
+    argv.addAll(params.command());
+    return submit(params, argv);
+}
+
+int simple(Params params) throws Exception {
+    var argv = new ArrayList<String>(List.of(CONTAINER, params.verb().subcommand()));
+    if (params.follow()) {
+        argv.add("-f");
+    }
+    if (params.lines() != null) {
+        argv.addAll(List.of("-n", params.lines()));
+    }
+    argv.add(PREFIX + params.target());
+    return submit(params, argv);
+}
+
+int list(Params params) throws Exception {
+    var argv = new ArrayList<String>(List.of(CONTAINER, Verb.LS.subcommand(), "--format", "table"));
+    if (params.all()) {
+        argv.add("-a");
+    }
+    if (params.dryRun()) {
+        return preview(argv);
+    }
+    var output = capture(argv);
+    if (output.status() != 0) {
+        return output.status();
+    }
+    var rows = output.stdout().lines().filter(this::isCapsule).toList();
+    if (rows.isEmpty()) {
+        Log.info("no capsules");
+        return 0;
+    }
+    IO.println(output.stdout().lines().findFirst().orElse(""));
+    IO.println(String.join("\n", rows));
+    return 0;
+}
+
+int inspect(Params params) throws Exception {
+    var argv = List.of(CONTAINER, Verb.INSPECT.subcommand(), PREFIX + params.target());
+    if (params.dryRun()) {
+        return preview(argv);
+    }
+    var output = capture(argv);
+    if (output.status() != 0) {
+        return output.status();
+    }
+    var posture = output.stdout().lines().filter(this::isCapsuleLabel).map(String::strip).collect(Collectors.joining("\n"));
+    if (!posture.isBlank()) {
+        Log.user(posture);
+    }
+    IO.println(output.stdout());
+    return 0;
+}
+
+boolean isCapsule(String line) {
+    return line.startsWith(PREFIX);
+}
+
+/// Matches the label keys zac wrote, not values that merely contain the id prefix.
+boolean isCapsuleLabel(String line) {
+    return line.strip().startsWith("\"zac");
+}
+
+int submit(Params params, List<String> argv) throws Exception {
+    return params.dryRun() ? preview(argv) : stream(argv);
+}
+
+int preview(List<String> argv) {
+    IO.println(quoted(argv));
+    return 0;
+}
+
+int stream(List<String> argv) throws Exception {
+    return new ProcessBuilder(argv).inheritIO().start().waitFor();
+}
+
+/// stderr is inherited even while stdout is captured: container's own error
+/// messages already name their remediation and should reach the user unchanged.
+Output capture(List<String> argv) throws Exception {
+    var process = new ProcessBuilder(argv).redirectError(ProcessBuilder.Redirect.INHERIT).start();
+    var stdout = new String(process.getInputStream().readAllBytes());
+    return new Output(process.waitFor(), stdout);
+}
+
+static List<String> ttyFlags() {
+    return System.console() != null ? List.of("-i", "-t") : List.of();
+}
+
+String quoted(List<String> argv) {
+    return argv.stream().map(this::quote).collect(Collectors.joining(" "));
+}
+
+String quote(String arg) {
+    return arg.matches("[A-Za-z0-9_@%+=:,./-]+") ? arg : "'" + arg.replace("'", "'\\''") + "'";
+}
+
+String usage() {
+    return """
+            Run AI coding agents inside isolated Apple containers.
+
+            Usage: %s <command> [name] [options] [-- <command in the capsule>]
+
+            Commands:
+              run       create, start and run a command in an ephemeral capsule
+              create    create a capsule without starting it
+              start     start a created capsule
+              exec      run a command inside a running capsule
+              ls        list capsules
+              inspect   show a capsule's capabilities
+              logs      show capsule logs
+              stop      stop a running capsule
+              rm        remove a capsule
+
+            Profiles (-profile):
+              sealed    read-only, no network, no credentials  (default)
+              review    read-only, network,    no credentials
+              build     read-write, network,   no credentials
+              trusted   read-write, network,   credentials
+
+            The profile sets the baseline; explicit flags always override it,
+            wherever they appear. Capabilities are fixed at run/create time.
+
+            Options:
+            %s
+
+            Examples:
+              %s run -profile:review -secret:ANTHROPIC_API_KEY -workspace:. -- claude -p "fix the bug"
+              %s create -name:agent1 -workspace:. -image:my/agent:latest -- sleep 600
+              %s exec agent1 -- sh -c "ls /workspace"
+            """.formatted(this.name, Opt.usage(), this.name, this.name, this.name);
+}
