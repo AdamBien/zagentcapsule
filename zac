@@ -6,7 +6,11 @@ String version = "2026-08-30.1";
 static final String PREFIX = "zac-";
 static final String MOUNT_TARGET = "/workspace";
 static final String CONTAINER = "container";
+static final String CONFIG_DIR = ".zac";
+static final String CONFIG_FILE = "zac.properties";
 static final int ZAC_ERROR = 2;
+
+Properties configuration;
 
 enum Log {
 
@@ -285,6 +289,7 @@ void main(String... args) throws Exception {
 }
 
 int dispatch(String... args) throws Exception {
+    this.configuration = configuration();
     var split = split(List.of(args));
     var options = split.options();
     if (options.isEmpty() || options.contains(Opt.HELP.option)) {
@@ -344,9 +349,9 @@ Params parse(Verb verb, List<String> options, List<String> command) {
     var positional = new ArrayList<String>();
     var profiles = new ArrayList<Profile>();
     var workspace = ".";
-    var image = System.getenv("ZAC_IMAGE");
-    var cpus = "2";
-    var memory = "2G";
+    String image = null;
+    String cpus = null;
+    String memory = null;
     String workdir = null;
     String id = null;
     String lines = null;
@@ -406,8 +411,10 @@ Capsule capsule(String target, String image, String workspace, List<Profile> pro
     if (profiles.size() > 1) {
         throw new IllegalArgumentException("only one -profile may be given");
     }
-    if (image == null || image.isBlank()) {
-        throw new IllegalArgumentException("no image - pass -image:<ref> or set ZAC_IMAGE");
+    var reference = image(image);
+    if (reference == null || reference.isBlank()) {
+        throw new IllegalArgumentException("no image - pass -image:<ref>, set ZAC_IMAGE, or add image= to ~/%s/%s"
+                .formatted(CONFIG_DIR, CONFIG_FILE));
     }
     var profile = profiles.isEmpty() ? Profile.SEALED : profiles.getFirst();
     var grants = resolve(profile, granted, revoked);
@@ -416,8 +423,9 @@ Capsule capsule(String target, String image, String workspace, List<Profile> pro
     }
     secrets.stream().filter(this::isUnset).findFirst().ifPresent(this::missingSecret);
     var id = target == null ? generated() : target;
-    return new Capsule(PREFIX + id, image, directory(workspace), grants, List.copyOf(secrets),
-            cpus, memory, workdir == null ? MOUNT_TARGET : workdir, profile, command);
+    return new Capsule(PREFIX + id, reference, directory(workspace), grants, List.copyOf(secrets),
+            setting("cpus", cpus, "2"), setting("memory", memory, "2G"),
+            setting("workdir", workdir, MOUNT_TARGET), profile, command);
 }
 
 /// The profile is the baseline; explicit flags always win, wherever they appear.
@@ -492,6 +500,37 @@ Path directory(String workspace) {
     } catch (IOException _) {
         throw new IllegalArgumentException("workspace not found: " + workspace);
     }
+}
+
+/// Only ~/.zac is read - deliberately not ./zac.properties. zac usually runs from the
+/// directory it is about to expose, so a working-directory file would let an agent with
+/// a read-write workspace rewrite the defaults of the next run.
+Properties configuration() {
+    var properties = new Properties();
+    var file = Path.of(System.getProperty("user.home"), CONFIG_DIR, CONFIG_FILE);
+    if (!Files.exists(file)) {
+        return properties;
+    }
+    try (var reader = Files.newBufferedReader(file)) {
+        properties.load(reader);
+    } catch (IOException _) {
+        throw new IllegalArgumentException("cannot read configuration: " + file);
+    }
+    return properties;
+}
+
+/// Flag wins, then the configuration file, then the built-in default. Capabilities are
+/// never resolved this way - a posture must be readable from the command line alone.
+String setting(String key, String flag, String fallback) {
+    return flag != null ? flag : this.configuration.getProperty(key, fallback);
+}
+
+String image(String flag) {
+    if (flag != null) {
+        return flag;
+    }
+    var environment = System.getenv("ZAC_IMAGE");
+    return environment != null ? environment : this.configuration.getProperty("image");
 }
 
 String generated() {
@@ -654,6 +693,11 @@ String usage() {
             The profile sets the baseline; explicit flags always override it,
             wherever they appear. Capabilities are fixed at run/create time.
 
+            Configuration (~/%s/%s), resource defaults only:
+              image, cpus, memory, workdir
+            Precedence: flag > $ZAC_IMAGE (image only) > configuration > built-in.
+            Capabilities are never read from configuration.
+
             Options:
             %s
 
@@ -661,5 +705,5 @@ String usage() {
               %s run -profile:review -secret:ANTHROPIC_API_KEY -workspace:. -- claude -p "fix the bug"
               %s create -name:agent1 -workspace:. -image:my/agent:latest -- sleep 600
               %s exec agent1 -- sh -c "ls /workspace"
-            """.formatted(this.name, Opt.usage(), this.name, this.name, this.name);
+            """.formatted(this.name, CONFIG_DIR, CONFIG_FILE, Opt.usage(), this.name, this.name, this.name);
 }
