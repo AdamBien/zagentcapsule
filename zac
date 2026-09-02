@@ -1,13 +1,13 @@
 #!/usr/bin/env -S java --source 25
 
 String name = MethodHandles.lookup().lookupClass().getName();
-String version = "2026-08-30.1";
+String version = "2026-08-30.3";
 
 static final String PREFIX = "zac-";
 static final String MOUNT_TARGET = "/workspace";
 static final String CONTAINER = "container";
 static final String CONFIG_DIR = ".zac";
-static final String CONFIG_FILE = "zac.properties";
+static final String CONFIG_FILE = "app.properties";
 static final int ZAC_ERROR = 2;
 
 Properties configuration;
@@ -551,8 +551,8 @@ int launch(Params params) throws Exception {
 void warn(Capsule capsule) {
     if (!capsule.can(Capability.NET)) {
         Log.warning("""
-                warning: network is disabled - the agent cannot reach its model API.
-                         Use -profile:review or -net to grant it.\
+                warning: network is disabled - nothing in the capsule can reach the network.
+                         An AI agent will not reach its model API. Grant with -profile:review or -net.\
                 """);
     }
     if (capsule.profile() == Profile.TRUSTED) {
@@ -669,7 +669,8 @@ String quote(String arg) {
 
 String usage() {
     return """
-            Run AI coding agents inside isolated Apple containers.
+            Run any command inside an isolated Apple container with explicit capabilities.
+            Built for autonomous coding agents; the capsule does not care what it runs.
 
             Usage: %s <command> [name] [options] [-- <command in the capsule>]
 
