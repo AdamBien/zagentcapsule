@@ -50,6 +50,47 @@ That is the whole contract. No flags means no capabilities: the directory is mou
 
 The exit code is `java`'s own, so `zac run … && echo ok` behaves the way you expect.
 
+### The same thing, configured
+
+Everything in that command except the command itself is plumbing, and plumbing belongs in `~/.zac/app.properties`:
+
+```properties
+image=amazoncorretto:25
+cpus=4
+memory=8G
+workdir=/workspace
+```
+
+That is the maximal configuration — those four keys are all `zac` will read. The invocation collapses to:
+
+```bash
+$ zac run -- java App.java
+```
+
+```
+zac 2026-09-02.1
+capsule zac-0637f91b  profile=sealed
+  workspace   /Users/abien/hello -> /workspace  (read-only)
+  network     disabled
+  credentials disabled
+  secrets     none
+  limits      cpus=4 memory=8G
+  image       amazoncorretto:25
+warning: network is disabled - nothing in the capsule can reach the network.
+         An AI agent will not reach its model API. Grant with -profile:review or -net.
+Hello from 25.0.4.1
+```
+
+`-workspace` was never needed — it defaults to `.`. So `zac run -- <command>` is the floor: the current directory, read-only, sealed off.
+
+Note what did **not** move into the file. The posture — read-only, no network, no credentials — is still stated in full on every launch, because it comes from the `sealed` default rather than from configuration. Adding `profile=trusted` to the file would change nothing; capabilities are not configurable by design. Config removes the plumbing, never the posture:
+
+```bash
+zac run -- java App.java                                   # sealed, and you can see it
+zac run -profile:review -secret:ANTHROPIC_API_KEY -- claude -p "review this"
+#       ^ every grant is still on the command line, always
+```
+
 ## Use
 
 ```bash
