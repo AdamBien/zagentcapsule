@@ -1,11 +1,12 @@
 #!/usr/bin/env -S java --source 25
 
 String name = MethodHandles.lookup().lookupClass().getName();
-String version = "2026-08-30.3";
+String version = "2026-10-05.1";
 
 static final String PREFIX = "zac-";
 static final String MOUNT_TARGET = "/workspace";
 static final String CONTAINER = "container";
+static final String LOOPBACK = "127.0.0.1";
 static final String CONFIG_DIR = ".zac";
 static final String CONFIG_FILE = "app.properties";
 static final int ZAC_ERROR = 2;
@@ -110,7 +111,7 @@ enum Verb {
     EnumSet<Opt> allowed() {
         return switch (this) {
             case RUN, CREATE -> EnumSet.of(Opt.PROFILE, Opt.WORKSPACE, Opt.RO, Opt.RW, Opt.NET, Opt.NO_NET,
-                    Opt.SSH, Opt.NO_SSH, Opt.SECRET, Opt.CPUS, Opt.MEMORY, Opt.IMAGE, Opt.WORKDIR, Opt.NAME, Opt.DRY_RUN);
+                    Opt.SSH, Opt.NO_SSH, Opt.SECRET, Opt.PUBLISH, Opt.CPUS, Opt.MEMORY, Opt.IMAGE, Opt.WORKDIR, Opt.NAME, Opt.DRY_RUN);
             case EXEC -> EnumSet.of(Opt.WORKDIR, Opt.DRY_RUN);
             case LS -> EnumSet.of(Opt.ALL, Opt.DRY_RUN);
             case LOGS -> EnumSet.of(Opt.FOLLOW, Opt.LINES, Opt.DRY_RUN);
@@ -151,6 +152,7 @@ enum Opt {
     SSH("-ssh", false, "forward the SSH agent socket"),
     NO_SSH("-no-ssh", false, "do not forward the SSH agent socket (default)"),
     SECRET("-secret", true, "inherit a host environment variable by name, repeatable"),
+    PUBLISH("-publish", true, "publish a port [host-ip:]host-port:container-port[/proto], repeatable (host-ip default: 127.0.0.1, requires network)"),
     CPUS("-cpus", true, "CPU limit (default: 2)"),
     MEMORY("-memory", true, "memory limit (default: 2G)"),
     IMAGE("-image", true, "container image (default: $ZAC_IMAGE)"),
@@ -189,7 +191,7 @@ enum Opt {
     }
 }
 
-record Capsule(String id, String image, Path workspace, Set<Capability> grants, List<String> secrets,
+record Capsule(String id, String image, Path workspace, Set<Capability> grants, List<String> secrets, List<String> ports,
                String cpus, String memory, String workdir, Profile profile, List<String> command) {
 
     boolean can(Capability capability) {
@@ -222,6 +224,10 @@ record Capsule(String id, String image, Path workspace, Set<Capability> grants, 
         return Stream.of("-e", key);
     }
 
+    List<String> publishFlags() {
+        return this.ports.stream().flatMap(port -> Stream.of("--publish", port)).toList();
+    }
+
     String posture() {
         return "%s+%s+%s".formatted(can(Capability.WRITE) ? "rw" : "ro",
                 can(Capability.NET) ? "net" : "nonet",
@@ -232,7 +238,8 @@ record Capsule(String id, String image, Path workspace, Set<Capability> grants, 
         return List.of("--label", "zac=capsule",
                 "--label", "zac.profile=" + this.profile.label(),
                 "--label", "zac.posture=" + posture(),
-                "--label", "zac.workspace=" + this.workspace);
+                "--label", "zac.workspace=" + this.workspace,
+                "--label", "zac.ports=" + (this.ports.isEmpty() ? "none" : String.join(",", this.ports)));
     }
 
     /// No "--" is emitted before the command: container declares its trailing
@@ -247,6 +254,7 @@ record Capsule(String id, String image, Path workspace, Set<Capability> grants, 
         argv.addAll(networkFlags());
         argv.addAll(sshFlags());
         argv.addAll(secretFlags());
+        argv.addAll(publishFlags());
         argv.addAll(List.of("--cpus", this.cpus, "--memory", this.memory, "-w", this.workdir));
         argv.addAll(labelFlags());
         argv.add(this.image);
@@ -261,6 +269,7 @@ record Capsule(String id, String image, Path workspace, Set<Capability> grants, 
                   network     %s
                   credentials %s
                   secrets     %s
+                  ports       %s
                   limits      cpus=%s memory=%s
                   image       %s\
                 """.formatted(this.id, this.profile.label(),
@@ -268,6 +277,7 @@ record Capsule(String id, String image, Path workspace, Set<Capability> grants, 
                 can(Capability.NET) ? "enabled" : "disabled",
                 can(Capability.SSH) ? "enabled" : "disabled",
                 this.secrets.isEmpty() ? "none" : String.join(", ", this.secrets) + " (inherited)",
+                this.ports.isEmpty() ? "none" : String.join(", ", this.ports),
                 this.cpus, this.memory, this.image);
     }
 }
@@ -346,6 +356,7 @@ Params parse(Verb verb, List<String> options, List<String> command) {
     var granted = EnumSet.noneOf(Capability.class);
     var revoked = EnumSet.noneOf(Capability.class);
     var secrets = new ArrayList<String>();
+    var ports = new ArrayList<String>();
     var positional = new ArrayList<String>();
     var profiles = new ArrayList<Profile>();
     var workspace = ".";
@@ -379,6 +390,7 @@ Params parse(Verb verb, List<String> options, List<String> command) {
             case SSH -> granted.add(Capability.SSH);
             case NO_SSH -> revoked.add(Capability.SSH);
             case SECRET -> secrets.add(secret(value(arg)));
+            case PUBLISH -> ports.add(port(value(arg)));
             case CPUS -> cpus = value(arg);
             case MEMORY -> memory = value(arg);
             case IMAGE -> image = value(arg);
@@ -400,13 +412,13 @@ Params parse(Verb verb, List<String> options, List<String> command) {
         throw new IllegalArgumentException(verb.subcommand() + " requires a capsule name");
     }
     var capsule = verb.creates()
-            ? capsule(target, image, workspace, profiles, granted, revoked, secrets, cpus, memory, workdir, command)
+            ? capsule(target, image, workspace, profiles, granted, revoked, secrets, ports, cpus, memory, workdir, command)
             : null;
     return new Params(verb, target, capsule, command, workdir, dryRun, all, follow, lines);
 }
 
 Capsule capsule(String target, String image, String workspace, List<Profile> profiles,
-                Set<Capability> granted, Set<Capability> revoked, List<String> secrets,
+                Set<Capability> granted, Set<Capability> revoked, List<String> secrets, List<String> ports,
                 String cpus, String memory, String workdir, List<String> command) {
     if (profiles.size() > 1) {
         throw new IllegalArgumentException("only one -profile may be given");
@@ -421,9 +433,12 @@ Capsule capsule(String target, String image, String workspace, List<Profile> pro
     if (grants.contains(Capability.SSH) && System.getenv("SSH_AUTH_SOCK") == null) {
         throw new IllegalArgumentException("SSH forwarding granted but SSH_AUTH_SOCK is not set on the host");
     }
+    if (!ports.isEmpty() && !grants.contains(Capability.NET)) {
+        throw new IllegalArgumentException("-publish needs a network interface - grant it with -net or -profile:review");
+    }
     secrets.stream().filter(this::isUnset).findFirst().ifPresent(this::missingSecret);
     var id = target == null ? generated() : target;
-    return new Capsule(PREFIX + id, reference, directory(workspace), grants, List.copyOf(secrets),
+    return new Capsule(PREFIX + id, reference, directory(workspace), grants, List.copyOf(secrets), List.copyOf(ports),
             setting("cpus", cpus, "2"), setting("memory", memory, "2G"),
             setting("workdir", workdir, MOUNT_TARGET), profile, command);
 }
@@ -458,7 +473,7 @@ void reject(Verb verb, Set<Opt> used) {
 
 boolean isCapabilityOpt(Opt opt) {
     return EnumSet.of(Opt.RO, Opt.RW, Opt.NET, Opt.NO_NET, Opt.SSH, Opt.NO_SSH, Opt.PROFILE,
-            Opt.SECRET, Opt.WORKSPACE).contains(opt);
+            Opt.SECRET, Opt.PUBLISH, Opt.WORKSPACE).contains(opt);
 }
 
 boolean isUnset(String key) {
@@ -482,6 +497,19 @@ String secret(String key) {
         throw new IllegalArgumentException("-secret takes a variable name, not a value: " + key.substring(0, key.indexOf('=')));
     }
     return key;
+}
+
+/// A spec without a host address binds to loopback: container's own default is every
+/// interface, which would expose the capsule to the local network, not just this machine.
+/// A bare port publishes the same port on both sides.
+String port(String spec) {
+    var parts = spec.split(":");
+    return switch (parts.length) {
+        case 1 -> "%s:%s:%s".formatted(LOOPBACK, spec.split("/")[0], spec);
+        case 2 -> LOOPBACK + ":" + spec;
+        case 3 -> spec;
+        default -> throw new IllegalArgumentException("invalid -publish spec: " + spec);
+    };
 }
 
 /// toRealPath resolves relative paths, follows the macOS /tmp symlink that virtiofs
@@ -706,5 +734,6 @@ String usage() {
               %s run -profile:review -secret:ANTHROPIC_API_KEY -workspace:. -- claude -p "fix the bug"
               %s create -name:agent1 -workspace:. -image:my/agent:latest -- sleep 600
               %s exec agent1 -- sh -c "ls /workspace"
-            """.formatted(this.name, CONFIG_DIR, CONFIG_FILE, Opt.usage(), this.name, this.name, this.name);
+              %s run -net -publish:8080 -- java Server.java
+            """.formatted(this.name, CONFIG_DIR, CONFIG_FILE, Opt.usage(), this.name, this.name, this.name, this.name);
 }

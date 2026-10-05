@@ -39,6 +39,7 @@ capsule zac-1e2a256e  profile=sealed
   network     disabled
   credentials disabled
   secrets     none
+  ports       none
   limits      cpus=2 memory=2G
   image       amazoncorretto:25
 warning: network is disabled - nothing in the capsule can reach the network.
@@ -74,6 +75,7 @@ capsule zac-0637f91b  profile=sealed
   network     disabled
   credentials disabled
   secrets     none
+  ports       none
   limits      cpus=4 memory=8G
   image       amazoncorretto:25
 warning: network is disabled - nothing in the capsule can reach the network.
@@ -146,6 +148,18 @@ Access is granted, never assumed. With no flags the capsule gets a read-only wor
 
 `-secret:` takes a variable *name*, never a value — the value is inherited from your environment by `container` itself, so it never appears in the command line or the process list. `-secret:KEY=value` is rejected.
 
+### Ports
+
+`-publish:` forwards a host port into the capsule (`container`'s `-p`), repeatable:
+
+```bash
+zac run -net -publish:8080 -- java Server.java              # 127.0.0.1:8080 -> 8080
+zac run -net -publish:9000:8080 -- java Server.java         # 127.0.0.1:9000 -> 8080
+zac run -net -publish:0.0.0.0:8080:8080/tcp -- java Server.java  # reachable from the LAN
+```
+
+A spec without a host address binds to `127.0.0.1`, not to every interface, so a published port is reachable from this machine only unless you name another address. Publishing needs a network interface, so `-publish:` is rejected without `-net` or a profile that grants it. Published ports appear in the summary and in the `zac.ports` label.
+
 Also configurable: `-cpus:`, `-memory:`, `-image:`, `-workdir:`, `-name:`, `-workspace:`.
 
 ## Configuration
@@ -211,6 +225,7 @@ capsule zac-ca7f1dac  profile=sealed
   network     disabled
   credentials disabled
   secrets     none
+  ports       none
   limits      cpus=2 memory=2G
   image       alpine
 warning: network is disabled - nothing in the capsule can reach the network.
