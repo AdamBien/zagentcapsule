@@ -62,7 +62,7 @@ memory=8G
 workdir=/workspace
 ```
 
-That is the maximal configuration — those four keys are all `zac` will read. The invocation collapses to:
+Those four keys plus `publish` (see [Configuration](#configuration)) are all `zac` will read. The invocation collapses to:
 
 ```bash
 $ zac run -- java App.java
@@ -177,7 +177,27 @@ Precedence: **flag > `$ZAC_IMAGE` (image only) > configuration file > built-in d
 
 Capabilities, profiles and the workspace path are deliberately **not** readable from configuration. A sandbox whose posture comes from invisible file state is not one you can audit by reading the command you typed, and the summary `zac` prints before every launch would no longer be the whole truth. Keys like `profile=trusted` or `network=enabled` in the file are silently inert.
 
-For the same reason `zac` reads only `~/.zac/` and ignores any `app.properties` in the working directory — you normally run `zac` from the very directory you are about to expose, so under `-rw` an agent could otherwise write a config file into its own workspace and change the defaults of the next run.
+The one exception is `publish`, a comma-separated list of `-publish:` specs. Any `-publish:` flag replaces the configured list instead of adding to it. Configured ports are printed in the summary like flag-given ones, and they still need the network to be granted on the command line, so a configured port cannot turn the network on by itself.
+
+### Aliases
+
+`zac` takes its name from the file it was started as and reads its configuration from `~/.<name>/app.properties`. A symlink is therefore an independent alias with its own directory — nothing is shared or inherited between `~/.zac` and `~/.zacserve`:
+
+```bash
+sudo ln -s /usr/local/bin/zac /usr/local/bin/zacserve
+```
+
+```properties
+# ~/.zacserve/app.properties
+image=amazoncorretto:25
+publish=8080,5005
+memory=4G
+```
+
+```bash
+zacserve run -net -- java Server.java    # 127.0.0.1:8080 and :5005, 4G
+zac run -- java App.java                 # reads ~/.zac only: no ports
+```
 
 ## Profiles
 

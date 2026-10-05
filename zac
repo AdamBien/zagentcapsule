@@ -7,7 +7,6 @@ static final String PREFIX = "zac-";
 static final String MOUNT_TARGET = "/workspace";
 static final String CONTAINER = "container";
 static final String LOOPBACK = "127.0.0.1";
-static final String CONFIG_DIR = ".zac";
 static final String CONFIG_FILE = "app.properties";
 static final int ZAC_ERROR = 2;
 
@@ -426,19 +425,21 @@ Capsule capsule(String target, String image, String workspace, List<Profile> pro
     var reference = image(image);
     if (reference == null || reference.isBlank()) {
         throw new IllegalArgumentException("no image - pass -image:<ref>, set ZAC_IMAGE, or add image= to ~/%s/%s"
-                .formatted(CONFIG_DIR, CONFIG_FILE));
+                .formatted(configDirectory(), CONFIG_FILE));
     }
     var profile = profiles.isEmpty() ? Profile.SEALED : profiles.getFirst();
     var grants = resolve(profile, granted, revoked);
     if (grants.contains(Capability.SSH) && System.getenv("SSH_AUTH_SOCK") == null) {
         throw new IllegalArgumentException("SSH forwarding granted but SSH_AUTH_SOCK is not set on the host");
     }
-    if (!ports.isEmpty() && !grants.contains(Capability.NET)) {
-        throw new IllegalArgumentException("-publish needs a network interface - grant it with -net or -profile:review");
+    var published = ports(ports);
+    if (!published.isEmpty() && !grants.contains(Capability.NET)) {
+        throw new IllegalArgumentException("publishing %s needs a network interface - grant it with -net or -profile:review"
+                .formatted(String.join(", ", published)));
     }
     secrets.stream().filter(this::isUnset).findFirst().ifPresent(this::missingSecret);
     var id = target == null ? generated() : target;
-    return new Capsule(PREFIX + id, reference, directory(workspace), grants, List.copyOf(secrets), List.copyOf(ports),
+    return new Capsule(PREFIX + id, reference, directory(workspace), grants, List.copyOf(secrets), published,
             setting("cpus", cpus, "2"), setting("memory", memory, "2G"),
             setting("workdir", workdir, MOUNT_TARGET), profile, command);
 }
@@ -535,7 +536,7 @@ Path directory(String workspace) {
 /// a read-write workspace rewrite the defaults of the next run.
 Properties configuration() {
     var properties = new Properties();
-    var file = Path.of(System.getProperty("user.home"), CONFIG_DIR, CONFIG_FILE);
+    var file = Path.of(System.getProperty("user.home"), configDirectory(), CONFIG_FILE);
     if (!Files.exists(file)) {
         return properties;
     }
@@ -545,6 +546,27 @@ Properties configuration() {
         throw new IllegalArgumentException("cannot read configuration: " + file);
     }
     return properties;
+}
+
+/// Named after the program, so each symlink to zac (zacserve -> zac) is an independent
+/// alias with its own directory: ~/.zac, ~/.zacserve.
+String configDirectory() {
+    return "." + this.name;
+}
+
+/// Flags replace the configured ports rather than add to them, matching "flag wins".
+/// Ports are the one exposure read from configuration; the summary still prints them
+/// before every launch, and -publish still requires a network grant on the command line.
+List<String> ports(List<String> flags) {
+    if (!flags.isEmpty()) {
+        return flags;
+    }
+    var configured = this.configuration.getProperty("publish", "");
+    return Stream.of(configured.split(","))
+            .map(String::strip)
+            .filter(spec -> !spec.isEmpty())
+            .map(this::port)
+            .toList();
 }
 
 /// Flag wins, then the configuration file, then the built-in default. Capabilities are
@@ -722,10 +744,12 @@ String usage() {
             The profile sets the baseline; explicit flags always override it,
             wherever they appear. Capabilities are fixed at run/create time.
 
-            Configuration (~/%s/%s), resource defaults only:
+            Configuration (~/%s/%s):
               image, cpus, memory, workdir
+              publish   comma-separated -publish specs; replaced by any -publish flag
             Precedence: flag > $ZAC_IMAGE (image only) > configuration > built-in.
-            Capabilities are never read from configuration.
+            Capabilities are never read from configuration; publish still requires -net.
+            A symlink to zac is an alias with its own ~/.<name>/%s.
 
             Options:
             %s
@@ -735,5 +759,5 @@ String usage() {
               %s create -name:agent1 -workspace:. -image:my/agent:latest -- sleep 600
               %s exec agent1 -- sh -c "ls /workspace"
               %s run -net -publish:8080 -- java Server.java
-            """.formatted(this.name, CONFIG_DIR, CONFIG_FILE, Opt.usage(), this.name, this.name, this.name, this.name);
+            """.formatted(this.name, configDirectory(), CONFIG_FILE, CONFIG_FILE, Opt.usage(), this.name, this.name, this.name, this.name);
 }
